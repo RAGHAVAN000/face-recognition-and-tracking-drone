@@ -1,0 +1,105 @@
+import argparse
+import sys
+import cv2
+import torch
+import numpy as np
+from vision.ssd.config.fd_config import define_img_size
+from vision.ssd.mb_tiny_fd import create_mb_tiny_fd, create_mb_tiny_fd_predictor
+from vision.ssd.mb_tiny_RFB_fd import create_Mb_Tiny_RFB_fd, create_Mb_Tiny_RFB_fd_predictor
+from vision.utils.misc import Timer
+from model import MobileFaceNet, get_mbf  # Assuming model.py contains MobileFaceNet
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Face Detection and Recognition in Video')
+parser.add_argument('--net_type', default="RFB", type=str, help='Network architecture: RFB or slim')
+parser.add_argument('--input_size', default=480, type=int, help='Network input size')
+parser.add_argument('--threshold', default=0.7, type=float, help='Score threshold')
+parser.add_argument('--candidate_size', default=1000, type=int, help='NMS candidate size')
+parser.add_argument('--video_path', default="/home/linzai/Videos/video/16_1.MP4", type=str, help='Path of video')
+parser.add_argument('--test_device', default="cuda:0", type=str, help='Device: cuda:0 or cpu')
+args = parser.parse_args()
+
+# Define image size for detection
+input_img_size = args.input_size
+define_img_size(input_img_size)
+
+# Load face detection model
+label_path = "./models/voc-model-labels.txt"
+class_names = [name.strip() for name in open(label_path).readlines()]
+num_classes = len(class_names)
+test_device = args.test_device
+candidate_size = args.candidate_size
+threshold = args.threshold
+
+if args.net_type == 'slim':
+    model_path = "models/pretrained/version-slim-320.pth"
+    net = create_mb_tiny_fd(len(class_names), is_test=True, device=test_device)
+    predictor = create_mb_tiny_fd_predictor(net, candidate_size=candidate_size, device=test_device)
+elif args.net_type == 'RFB':
+    model_path = "models/pretrained/version-RFB-320.pth"
+    net = create_Mb_Tiny_RFB_fd(len(class_names), is_test=True, device=test_device)
+    predictor = create_Mb_Tiny_RFB_fd_predictor(net, candidate_size=candidate_size, device=test_device)
+else:
+    print("Invalid net type!")
+    sys.exit(1)
+net.load(model_path)
+
+# Load face recognition model
+def load_face_recognition_model():
+    model = get_mbf(fp16=False, num_features=512)
+    model.load_state_dict(torch.load('path/to/your/facenet_model.pth'))
+    model.eval()
+    return model
+
+face_recognition_model = load_face_recognition_model()
+
+def extract_face_embeddings(face_image, model):
+    face_image = cv2.resize(face_image, (112, 112))  # Resize to model input size
+    face_image = np.transpose(face_image, (2, 0, 1))  # Convert to CHW format
+    face_image = torch.tensor(face_image, dtype=torch.float32).unsqueeze(0) / 255.0  # Normalize
+    with torch.no_grad():
+        embeddings = model(face_image)
+    return embeddings
+
+def recognize_face(face_image, model):
+    embedding = extract_face_embeddings(face_image, model)
+    # Implement your face recognition logic here (e.g., compare embeddings with known faces)
+    # For demonstration, we'll just print the embedding
+    print(embedding)
+    return embedding
+
+# Open video capture
+cap = cv2.VideoCapture(args.video_path)
+timer = Timer()
+sum_faces = 0
+
+while True:
+    ret, orig_image = cap.read()
+    if orig_image is None:
+        print("End of video")
+        break
+
+    image = cv2.cvtColor(orig_image, cv2.COLOR_BGR2RGB)
+    timer.start()
+    boxes, labels, probs = predictor.predict(image, candidate_size / 2, threshold)
+    interval = timer.end()
+    print('Time: {:.6f}s, Detected Faces: {:d}.'.format(interval, labels.size(0)))
+
+    for i in range(boxes.size(0)):
+        box = boxes[i, :]
+        label = f" {probs[i]:.2f}"
+        cv2.rectangle(orig_image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 4)
+        
+        face_image = orig_image[int(box[1]):int(box[3]), int(box[0]):int(box[2])]
+        embedding = recognize_face(face_image, face_recognition_model)
+        # Here you can implement the logic to match embeddings with known faces and display the name
+
+    orig_image = cv2.resize(orig_image, None, None, fx=0.8, fy=0.8)
+    sum_faces += boxes.size(0)
+    cv2.imshow('Annotated', orig_image)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+print("Total faces detected: {}".format(sum_faces))
